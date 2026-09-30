@@ -11,14 +11,13 @@ For a card whose **Reading** field is `鼻水`, the **Notes** field becomes:
 水 water Kun: みず、 みず- On: スイ
 ```
 
-It uses the Python 3 standard library only — no pip packages, no virtualenv.
+It uses the Python 3 standard library only — no pip packages, no virtualenv,
+and no Anki add-ons. It edits your Anki collection file directly.
 
 ## Prerequisites
 
 - **macOS** (Windows is not supported).
-- **Anki**, running while the tool works.
-- The **AnkiConnect** add-on (add-on code `2055492159`).
-  In Anki: *Tools → Add-ons → Get Add-ons…*, paste `2055492159`, then restart Anki.
+- **Anki**, which must be **closed** while the tool works. No add-ons are needed.
 - **Python 3**, which ships with the Xcode Command Line Tools
   (`xcode-select --install`) or can be installed with Homebrew (`brew install python`).
 
@@ -42,20 +41,24 @@ You can also run the script directly without installing:
 
 ## Usage
 
-With Anki open:
+Quit Anki, then run:
 
 ```sh
 updateKanji
 ```
 
-Every note in the deck whose Notes field is empty is looked up and updated:
+Every note in the deck (and its subdecks) whose Notes field is empty is looked
+up and updated:
 
 ```
+Backed up collection to .../collection.anki2.20260930-120000.bak
 Updated 鼻水
 Updated 食べ物
 
 Done. Updated: 2, skipped: 0, errors: 0
 ```
+
+Open Anki again afterwards; the changes sync like any other edit.
 
 ### Options
 
@@ -66,7 +69,8 @@ Done. Updated: 2, skipped: 0, errors: 0
 | `--notes-field FIELD` | `Notes` | Field to fill in. |
 | `--dry-run` | off | Print what would be written, change nothing. |
 | `--limit N` | all | Only process the first N notes with an empty Notes field. |
-| `--url URL` | `http://127.0.0.1:8765` | AnkiConnect endpoint. |
+| `--profile NAME` | the only profile | Anki profile folder in `~/Library/Application Support/Anki2`. Required if you have several profiles. |
+| `--collection PATH` | — | Path to a `collection.anki2` file (overrides `--profile`). |
 
 ### Examples
 
@@ -80,20 +84,25 @@ updateKanji --deck "Japanese::Mining" --reading-field Word --notes-field Meaning
 
 ## How it works
 
-1. `findNotes` with `deck:<deck>` and `notesInfo` through AnkiConnect.
+1. The profile's `collection.anki2` (an SQLite database) is opened with Python's
+   built-in `sqlite3`, and the notes that have cards in the deck or its
+   subdecks are read.
 2. Notes whose Notes field is empty (ignoring whitespace and markup such as
    `<br>`, `&nbsp;` and `<div></div>`) are selected.
 3. Each unique kanji in the Reading field is extracted, in order.
 4. `https://jisho.org/search/<kanji>%20%23kanji` is fetched for each kanji
    (results are cached per run, with a short pause between requests).
-5. The lines are joined with `<br>` and written back with `updateNoteFields`.
+5. Before the first write, the collection is backed up next to itself as
+   `collection.anki2.<timestamp>.bak`.
+6. The lines are joined with `<br>` and written into the note. The note and the
+   collection are marked as modified so the change syncs to AnkiWeb.
 
 Notes without kanji, or where every Jisho lookup fails, are left untouched.
 
 ## Tests
 
-The parsing logic is covered by tests that use saved Jisho HTML, so no network
-or Anki instance is needed:
+The tests use saved Jisho HTML and a small throwaway collection file, so no
+network or Anki install is needed:
 
 ```sh
 python3 -m unittest discover -s tests
@@ -101,8 +110,12 @@ python3 -m unittest discover -s tests
 
 ## Troubleshooting
 
-- **`Could not reach AnkiConnect`** — Anki is not running, or AnkiConnect is not
-  installed/enabled. Restart Anki after installing the add-on.
+- **`The Anki collection is in use`** — Anki is still open. Quit it fully
+  (⌘Q) and run the tool again.
+- **`Several Anki profiles found`** — pass `--profile "User 1"` (the folder
+  name under `~/Library/Application Support/Anki2`).
+- **Undo** — quit Anki and replace `collection.anki2` with the `.bak` file the
+  tool printed (rename it back to `collection.anki2`).
 - **`Note ... has no field 'Notes'`** — your note type uses different field
   names; pass `--reading-field` / `--notes-field`.
 - **No notes found** — check the deck name, including `::` subdeck separators.
