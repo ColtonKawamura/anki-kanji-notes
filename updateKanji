@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 """updateKanji - fill empty Anki "Notes" fields with kanji info from Jisho.org.
 
-Reads notes from an Anki deck through the AnkiConnect add-on, and for every
-note whose Notes field is empty, looks up each kanji of the Reading field on
+Reads notes straight from your Anki collection file (Anki must be closed), and
+for every note whose Notes field is empty, looks up each kanji of the Reading field on
 jisho.org and writes the meanings and readings back into the Notes field.
 
 Python 3 standard library only.
 """
 
 import argparse
+import hashlib
 import json
+import os
 import re
+import sqlite3
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
-
-ANKI_CONNECT_URL = "http://127.0.0.1:8765"
-ANKI_CONNECT_VERSION = 6
 
 JISHO_SEARCH_URL = "https://jisho.org/search/{query}"
 USER_AGENT = (
@@ -53,8 +53,8 @@ VOID_TAGS = frozenset(
 )
 
 
-class AnkiConnectError(Exception):
-    """Raised when AnkiConnect cannot be reached or returns an error."""
+class AnkiError(Exception):
+    """Raised when the Anki collection cannot be read or written."""
 
 
 def strip_html(value):
@@ -232,28 +232,209 @@ class JishoClient:
         return line
 
 
-def anki_request(action, url=ANKI_CONNECT_URL, timeout=30, **params):
-    """Call an AnkiConnect action and return its result."""
-    payload = json.dumps(
-        {"action": action, "version": ANKI_CONNECT_VERSION, "params": params}
-    ).encode("utf-8")
-    request = urllib.request.Request(
-        url, data=payload, headers={"Content-Type": "application/json"}
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            body = json.loads(response.read().decode("utf-8"))
-    except urllib.error.URLError as exc:
-        raise AnkiConnectError(
-            "Could not reach AnkiConnect at %s (%s).\n"
-            "Make sure Anki is running and the AnkiConnect add-on "
-            "(code 2055492159) is installed." % (url, exc)
+def default_anki_dir():
+    """Return Anki's data folder on macOS."""
+    return os.path.join(os.path.expanduser("~"), "Library", "Application Support", "Anki2")
+
+
+def find_collection(profile=None, anki_dir=None):
+    """Return the path of the profile's ``collection.anki2``."""
+    anki_dir = anki_dir or default_anki_dir()
+    if profile:
+        path = os.path.join(anki_dir, profile, "collection.anki2")
+        if not os.path.isfile(path):
+            raise AnkiError("No Anki collection found at %s" % path)
+        return path
+    profiles = []
+    if os.path.isdir(anki_dir):
+        for name in sorted(os.listdir(anki_dir)):
+            if os.path.isfile(os.path.join(anki_dir, name, "collection.anki2")):
+                profiles.append(name)
+    if not profiles:
+        raise AnkiError(
+            "No Anki profile found in %s.\n"
+            "Use --collection to point at your collection.anki2." % anki_dir
         )
-    except (OSError, ValueError) as exc:
-        raise AnkiConnectError("Invalid response from AnkiConnect: %s" % exc)
-    if isinstance(body, dict) and body.get("error"):
-        raise AnkiConnectError("AnkiConnect error for '%s': %s" % (action, body["error"]))
-    return body.get("result") if isinstance(body, dict) else None
+    if len(profiles) > 1:
+        raise AnkiError(
+            "Several Anki profiles found (%s). Choose one with --profile."
+            % ", ".join(profiles)
+        )
+    return os.path.join(anki_dir, profiles[0], "collection.anki2")
+
+
+def _unicase(a, b):
+    a, b = a.casefold(), b.casefold()
+    return (a > b) - (a < b)
+
+
+def _read_varint(data, pos):
+    result = shift = 0
+    while True:
+        byte = data[pos]
+        pos += 1
+        result |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return result, pos
+        shift += 7
+
+
+def protobuf_uint_field(data, number):
+    """Return varint field ``number`` of a protobuf message (0 if absent)."""
+    pos = 0
+    value = 0
+    data = bytes(data or b"")
+    while pos < len(data):
+        key, pos = _read_varint(data, pos)
+        field, wire = key >> 3, key & 7
+        if wire == 0:
+            raw, pos = _read_varint(data, pos)
+            if field == number:
+                value = raw
+        elif wire == 1:
+            pos += 8
+        elif wire == 2:
+            length, pos = _read_varint(data, pos)
+            pos += length
+        elif wire == 5:
+            pos += 4
+        else:
+            break
+    return value
+
+
+def field_checksum(value):
+    """Anki's duplicate-check checksum of a note's first field."""
+    digest = hashlib.sha1(strip_html(value).strip().encode("utf-8")).hexdigest()
+    return int(digest[:8], 16)
+
+
+class AnkiCollection:
+    """Minimal direct access to an Anki ``collection.anki2`` SQLite file.
+
+    Anki must be closed: it keeps the database locked while it is open.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        try:
+            self.db = sqlite3.connect(path, timeout=1, isolation_level=None)
+            self.db.create_collation("unicase", _unicase)
+            self.db.execute("BEGIN IMMEDIATE")
+            self.db.execute("ROLLBACK")
+            tables = {row[0] for row in self.db.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        except sqlite3.Error as exc:
+            if "locked" in str(exc) or "busy" in str(exc):
+                raise AnkiError(
+                    "The Anki collection is in use (%s).\n"
+                    "Quit Anki completely and run updateKanji again." % path
+                )
+            raise AnkiError("Could not open Anki collection %s (%s)" % (path, exc))
+        if "notes" not in tables or "col" not in tables:
+            raise AnkiError("%s does not look like an Anki collection." % path)
+        self.new_schema = "decks" in tables and "fields" in tables and "notetypes" in tables
+
+    def close(self):
+        self.db.close()
+
+    def backup(self, dest):
+        """Write a consistent copy of the collection to ``dest``."""
+        try:
+            target = sqlite3.connect(dest)
+            try:
+                self.db.backup(target)
+            finally:
+                target.close()
+        except (sqlite3.Error, OSError) as exc:
+            raise AnkiError("Could not back up the collection to %s (%s)" % (dest, exc))
+
+    def _decks(self):
+        """Yield ``(id, name)`` with ``::`` separating subdecks."""
+        if self.new_schema:
+            for did, name in self.db.execute("SELECT id, name FROM decks"):
+                yield did, name.replace("\x1f", "::")
+        else:
+            (raw,) = self.db.execute("SELECT decks FROM col").fetchone()
+            for deck in json.loads(raw).values():
+                yield deck["id"], deck["name"]
+
+    def _notetypes(self):
+        """Return ``{notetype_id: (field_names, sort_field_index)}``."""
+        result = {}
+        if self.new_schema:
+            fields = {}
+            for ntid, ord_, name in self.db.execute(
+                "SELECT ntid, ord, name FROM fields ORDER BY ntid, ord"
+            ):
+                fields.setdefault(ntid, []).append(name)
+            for ntid, config in self.db.execute("SELECT id, config FROM notetypes"):
+                result[ntid] = (fields.get(ntid, []), protobuf_uint_field(config, 2))
+        else:
+            (raw,) = self.db.execute("SELECT models FROM col").fetchone()
+            for model in json.loads(raw).values():
+                names = [f["name"] for f in sorted(model["flds"], key=lambda f: f["ord"])]
+                result[int(model["id"])] = (names, model.get("sortf", 0))
+        return result
+
+    def find_notes(self, deck):
+        """Return notes in ``deck`` (and its subdecks) as dicts."""
+        wanted = deck.casefold()
+        deck_ids = [
+            did for did, name in self._decks()
+            if name.casefold() == wanted or name.casefold().startswith(wanted + "::")
+        ]
+        if not deck_ids:
+            return []
+        notetypes = self._notetypes()
+        placeholders = ",".join("?" * len(deck_ids))
+        rows = self.db.execute(
+            "SELECT id, mid, flds FROM notes WHERE id IN "
+            "(SELECT DISTINCT nid FROM cards WHERE did IN (%s) OR odid IN (%s)) "
+            "ORDER BY id" % (placeholders, placeholders),
+            deck_ids + deck_ids,
+        ).fetchall()
+        notes = []
+        for nid, mid, flds in rows:
+            names, sort_idx = notetypes.get(mid, ([], 0))
+            values = flds.split("\x1f")
+            notes.append({
+                "noteId": nid,
+                "mid": mid,
+                "fieldNames": names,
+                "sortIdx": sort_idx,
+                "fields": dict(zip(names, values)),
+                "values": values,
+            })
+        return notes
+
+    def update_field(self, note, field, value):
+        """Set ``field`` of ``note`` and mark the note/collection as changed."""
+        names = note["fieldNames"]
+        index = names.index(field)
+        values = list(note["values"]) + [""] * (len(names) - len(note["values"]))
+        values[index] = value
+        now = time.time()
+        sets = ["flds = ?", "mod = ?", "usn = -1"]
+        params = ["\x1f".join(values), int(now)]
+        if index == note["sortIdx"]:
+            sets.append("sfld = ?")
+            params.append(strip_html(value).strip())
+        if index == 0:
+            sets.append("csum = ?")
+            params.append(field_checksum(value))
+        params.append(note["noteId"])
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            self.db.execute("UPDATE notes SET %s WHERE id = ?" % ", ".join(sets), params)
+            self.db.execute("UPDATE col SET mod = ?", (int(now * 1000),))
+            self.db.execute("COMMIT")
+        except sqlite3.Error as exc:
+            if self.db.in_transaction:
+                self.db.execute("ROLLBACK")
+            raise AnkiError(str(exc))
+        note["values"] = values
+        note["fields"][field] = value
 
 
 def build_notes_html(lines):
@@ -262,36 +443,43 @@ def build_notes_html(lines):
 
 
 def process(args):
-    url = args.url
-    query = "deck:%s" % args.deck
-    note_ids = anki_request("findNotes", url=url, query=query) or []
-    if not note_ids:
-        print("No notes found for query '%s'." % query)
+    path = args.collection or find_collection(args.profile)
+    collection = AnkiCollection(path)
+    try:
+        return _process(args, collection)
+    finally:
+        collection.close()
+
+
+def _process(args, collection):
+    notes = collection.find_notes(args.deck)
+    if not notes:
+        print("No notes found in deck '%s'." % args.deck)
         return 0
 
-    notes = anki_request("notesInfo", url=url, notes=note_ids) or []
     client = JishoClient()
 
     updated = skipped = errors = 0
     processed = 0
+    backed_up = False
     for note in notes:
         fields = note.get("fields", {})
         for field in (args.reading_field, args.notes_field):
             if field not in fields:
-                raise AnkiConnectError(
+                raise AnkiError(
                     "Note %s has no field '%s'. Available fields: %s.\n"
                     "Use --reading-field/--notes-field to match your note type."
                     % (note.get("noteId"), field, ", ".join(sorted(fields)) or "(none)")
                 )
 
-        if not is_field_empty(fields[args.notes_field].get("value", "")):
+        if not is_field_empty(fields[args.notes_field]):
             continue
 
         if args.limit and processed >= args.limit:
             break
         processed += 1
 
-        reading = fields[args.reading_field].get("value", "")
+        reading = fields[args.reading_field]
         reading_text = strip_html(reading).strip()
         kanji_list = extract_kanji(reading)
         if not kanji_list:
@@ -313,13 +501,15 @@ def process(args):
             updated += 1
             continue
 
+        if not backed_up:
+            backup_path = "%s.%s.bak" % (collection.path, time.strftime("%Y%m%d-%H%M%S"))
+            collection.backup(backup_path)
+            print("Backed up collection to %s" % backup_path)
+            backed_up = True
+
         try:
-            anki_request(
-                "updateNoteFields",
-                url=url,
-                note={"id": note["noteId"], "fields": {args.notes_field: notes_html}},
-            )
-        except AnkiConnectError as exc:
+            collection.update_field(note, args.notes_field, notes_html)
+        except AnkiError as exc:
             print("Error updating %s: %s" % (reading_text, exc), file=sys.stderr)
             errors += 1
             continue
@@ -353,7 +543,10 @@ def parse_args(argv=None):
         "--limit", type=int, default=0, metavar="N", help="Only process the first N empty notes"
     )
     parser.add_argument(
-        "--url", default=ANKI_CONNECT_URL, help="AnkiConnect URL (default: %s)" % ANKI_CONNECT_URL
+        "--profile", help="Anki profile name (default: the only profile in %s)" % default_anki_dir()
+    )
+    parser.add_argument(
+        "--collection", metavar="PATH", help="Path to collection.anki2 (overrides --profile)"
     )
     return parser.parse_args(argv)
 
@@ -365,7 +558,7 @@ def main(argv=None):
         return 2
     try:
         return process(args)
-    except AnkiConnectError as exc:
+    except AnkiError as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 1
     except KeyboardInterrupt:
