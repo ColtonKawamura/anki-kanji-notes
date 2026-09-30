@@ -122,6 +122,52 @@ class CollectionTest(unittest.TestCase):
             holder.execute("ROLLBACK")
             holder.close()
 
+    def test_collection_locked_while_open(self):
+        col = updateKanji.AnkiCollection(self.path)
+        try:
+            other = sqlite3.connect(self.path, timeout=0.1)
+            try:
+                with self.assertRaises(sqlite3.OperationalError):
+                    other.execute("SELECT count(*) FROM notes").fetchone()
+            finally:
+                other.close()
+        finally:
+            col.close()
+        db = sqlite3.connect(self.path)
+        try:
+            self.assertEqual(db.execute("SELECT count(*) FROM notes").fetchone()[0], 5)
+        finally:
+            db.close()
+
+    def test_damaged_collection_is_refused(self):
+        db = sqlite3.connect(self.path)
+        page_size = db.execute("PRAGMA page_size").fetchone()[0]
+        root = db.execute(
+            "SELECT rootpage FROM sqlite_master WHERE name = 'notes'").fetchone()[0]
+        db.close()
+        with open(self.path, "r+b") as f:
+            f.seek((root - 1) * page_size)
+            f.write(b"\xff" * 64)
+        with self.assertRaises(updateKanji.AnkiCorruptError) as ctx:
+            updateKanji.AnkiCollection(self.path)
+        self.assertIn("Check Database", str(ctx.exception))
+        code, _ = self.run_main()
+        self.assertEqual(code, 1)
+        self.assertEqual([n for n in os.listdir(self.tmp.name) if n.endswith(".bak")], [])
+
+    def test_corrupt_write_stops_run(self):
+        calls = []
+
+        def broken_update(col, note, field, value):
+            calls.append(note["noteId"])
+            raise updateKanji.AnkiCorruptError("database disk image is malformed")
+
+        with mock.patch.object(updateKanji.AnkiCollection, "update_field", broken_update):
+            code, out = self.run_main()
+        self.assertEqual(code, 1)
+        self.assertEqual(calls, [10])
+        self.assertNotIn("Done.", out)
+
     def run_main(self, *extra):
         out = io.StringIO()
         real_client = updateKanji.JishoClient

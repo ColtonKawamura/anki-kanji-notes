@@ -57,6 +57,23 @@ class AnkiError(Exception):
     """Raised when the Anki collection cannot be read or written."""
 
 
+class AnkiCorruptError(AnkiError):
+    """Raised when SQLite reports that the collection file is damaged."""
+
+
+CORRUPT_HELP = (
+    "Nothing more will be written. To repair it, open Anki and run "
+    "Tools > Check Database, or quit Anki and restore a backup "
+    "(a collection.anki2.*.bak file made by updateKanji, or Anki's own "
+    "File > Switch Profile > Open Backup)."
+)
+
+
+def _is_corrupt(exc):
+    message = str(exc).lower()
+    return "malformed" in message or "not a database" in message
+
+
 def strip_html(value):
     """Turn an Anki HTML field value into plain text."""
     if not value:
@@ -317,26 +334,43 @@ class AnkiCollection:
 
     def __init__(self, path):
         self.path = path
+        self.db = None
         try:
             self.db = sqlite3.connect(path, timeout=1, isolation_level=None)
             self.db.create_collation("unicase", _unicase)
-            self.db.execute("BEGIN IMMEDIATE")
-            self.db.execute("ROLLBACK")
+            # Take an exclusive lock and keep it until close(), so Anki cannot
+            # open the collection while we are still writing to it.
+            self.db.execute("PRAGMA locking_mode = EXCLUSIVE")
+            self.db.execute("BEGIN EXCLUSIVE")
+            self.db.execute("COMMIT")
+            check = [row[0] for row in self.db.execute("PRAGMA quick_check")]
             tables = {row[0] for row in self.db.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table'")}
         except sqlite3.Error as exc:
+            self.close()
             if "locked" in str(exc) or "busy" in str(exc):
                 raise AnkiError(
                     "The Anki collection is in use (%s).\n"
                     "Quit Anki completely and run updateKanji again." % path
                 )
+            if _is_corrupt(exc):
+                raise AnkiCorruptError(
+                    "The Anki collection %s is damaged (%s).\n%s" % (path, exc, CORRUPT_HELP))
             raise AnkiError("Could not open Anki collection %s (%s)" % (path, exc))
+        if check != ["ok"]:
+            self.close()
+            raise AnkiCorruptError(
+                "The Anki collection %s is damaged (%s).\n%s"
+                % (path, "; ".join(check[:3]), CORRUPT_HELP)
+            )
         if "notes" not in tables or "col" not in tables:
             raise AnkiError("%s does not look like an Anki collection." % path)
         self.new_schema = "decks" in tables and "fields" in tables and "notetypes" in tables
 
     def close(self):
-        self.db.close()
+        if self.db is not None:
+            self.db.close()
+            self.db = None
 
     def backup(self, dest):
         """Write a consistent copy of the collection to ``dest``."""
@@ -431,7 +465,13 @@ class AnkiCollection:
             self.db.execute("COMMIT")
         except sqlite3.Error as exc:
             if self.db.in_transaction:
-                self.db.execute("ROLLBACK")
+                try:
+                    self.db.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+            if _is_corrupt(exc):
+                raise AnkiCorruptError(
+                    "The Anki collection is damaged (%s).\n%s" % (exc, CORRUPT_HELP))
             raise AnkiError(str(exc))
         note["values"] = values
         note["fields"][field] = value
@@ -509,6 +549,8 @@ def _process(args, collection):
 
         try:
             collection.update_field(note, args.notes_field, notes_html)
+        except AnkiCorruptError:
+            raise
         except AnkiError as exc:
             print("Error updating %s: %s" % (reading_text, exc), file=sys.stderr)
             errors += 1

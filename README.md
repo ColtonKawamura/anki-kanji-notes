@@ -92,9 +92,11 @@ updateKanji --deck "Japanese::Mining" --reading-field Word --notes-field Meaning
 3. Each unique kanji in the Reading field is extracted, in order.
 4. `https://jisho.org/search/<kanji>%20%23kanji` is fetched for each kanji
    (results are cached per run, with a short pause between requests).
-5. Before the first write, the collection is backed up next to itself as
+5. The collection is locked exclusively for the whole run and checked with
+   `PRAGMA quick_check`; a damaged collection is never written to.
+6. Before the first write, the collection is backed up next to itself as
    `collection.anki2.<timestamp>.bak`.
-6. The lines are joined with `<br>` and written into the note. The note and the
+7. The lines are joined with `<br>` and written into the note. The note and the
    collection are marked as modified so the change syncs to AnkiWeb.
 
 Notes without kanji, or where every Jisho lookup fails, are left untouched.
@@ -111,7 +113,15 @@ python3 -m unittest discover -s tests
 ## Troubleshooting
 
 - **`The Anki collection is in use`** — Anki is still open. Quit it fully
-  (⌘Q) and run the tool again.
+  (⌘Q) and run the tool again. While updateKanji runs it keeps the collection
+  locked, so wait for `Done.` before reopening Anki.
+- **`database disk image is malformed` / `The Anki collection ... is damaged`**
+  — the collection file is corrupted (for example, Anki was opened while
+  an older version of this tool was still writing). updateKanji now checks the
+  file before touching it and stops at the first sign of damage. To repair it,
+  open Anki and run **Tools → Check Database**, or quit Anki and restore the
+  `.bak` file the tool printed (or one of Anki's own backups via
+  **File → Switch Profile → Open Backup**), then run updateKanji again.
 - **`Several Anki profiles found`** — pass `--profile "User 1"` (the folder
   name under `~/Library/Application Support/Anki2`).
 - **Undo** — quit Anki and replace `collection.anki2` with the `.bak` file the
