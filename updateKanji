@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+"""updateKanji - fill empty Anki "Notes" fields with kanji info from Jisho.org.
+
+Reads notes from an Anki deck through the AnkiConnect add-on, and for every
+note whose Notes field is empty, looks up each kanji of the Reading field on
+jisho.org and writes the meanings and readings back into the Notes field.
+
+Python 3 standard library only.
+"""
+
+import argparse
+import json
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from html.parser import HTMLParser
+
+ANKI_CONNECT_URL = "http://127.0.0.1:8765"
+ANKI_CONNECT_VERSION = 6
+
+JISHO_SEARCH_URL = "https://jisho.org/search/{query}"
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+REQUEST_DELAY_SECONDS = 0.5
+READING_SEPARATOR = "、 "
+
+KANJI_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
+TAG_RE = re.compile(r"<[^>]*>")
+
+VOID_TAGS = frozenset(
+    [
+        "area",
+        "base",
+        "br",
+        "col",
+        "embed",
+        "hr",
+        "img",
+        "input",
+        "link",
+        "meta",
+        "param",
+        "source",
+        "track",
+        "wbr",
+    ]
+)
+
+
+class AnkiConnectError(Exception):
+    """Raised when AnkiConnect cannot be reached or returns an error."""
+
+
+def strip_html(value):
+    """Turn an Anki HTML field value into plain text."""
+    if not value:
+        return ""
+    text = value.replace("&nbsp;", " ").replace("&#160;", " ")
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = TAG_RE.sub("", text)
+    text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    return text
+
+
+def is_field_empty(value):
+    """True when an Anki field holds nothing but whitespace/empty markup."""
+    return not strip_html(value).strip()
+
+
+def extract_kanji(reading):
+    """Return the unique kanji of ``reading``, in order of first appearance."""
+    seen = []
+    for char in KANJI_RE.findall(strip_html(reading)):
+        if char not in seen:
+            seen.append(char)
+    return seen
+
+
+class JishoKanjiParser(HTMLParser):
+    """Pull meanings and Kun/On readings out of a Jisho kanji search page."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.meanings = ""
+        self.kun_readings = []
+        self.on_readings = []
+        self._stack = []
+        self._meanings_parts = []
+        self._anchor_parts = None
+        self._finished = set()
+
+    # -- helpers ---------------------------------------------------------
+    @property
+    def _section(self):
+        return self._stack[-1][1] if self._stack else None
+
+    @property
+    def _in_readings_list(self):
+        return bool(self._stack) and self._stack[-1][2]
+
+    # -- HTMLParser hooks ------------------------------------------------
+    def handle_starttag(self, tag, attrs):
+        classes = set()
+        for name, value in attrs:
+            if name == "class" and value:
+                classes.update(value.split())
+
+        parent_section = self._section
+        section = parent_section
+        in_list = self._in_readings_list
+        if "kanji-details__main-meanings" in classes:
+            section = "meanings"
+            in_list = False
+        elif "kun_yomi" in classes:
+            section = "kun"
+            in_list = False
+        elif "on_yomi" in classes:
+            section = "on"
+            in_list = False
+        if "kanji-details__main-readings-list" in classes:
+            in_list = True
+        is_section_root = section is not None and section != parent_section
+
+        if (
+            tag == "a"
+            and in_list
+            and section in ("kun", "on")
+            and section not in self._finished
+        ):
+            self._anchor_parts = []
+
+        if tag not in VOID_TAGS:
+            self._stack.append((tag, section, in_list, is_section_root))
+
+    def handle_startendtag(self, tag, attrs):
+        pass
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._anchor_parts is not None:
+            reading = "".join(self._anchor_parts).strip()
+            self._anchor_parts = None
+            section = self._section
+            if reading and section not in self._finished:
+                if section == "kun":
+                    self.kun_readings.append(reading)
+                elif section == "on":
+                    self.on_readings.append(reading)
+
+        for index in range(len(self._stack) - 1, -1, -1):
+            if self._stack[index][0] == tag:
+                closed = self._stack[index:]
+                del self._stack[index:]
+                for _, section, _, is_section_root in reversed(closed):
+                    if not is_section_root:
+                        continue
+                    if section == "meanings" and "meanings" not in self._finished:
+                        self.meanings = " ".join("".join(self._meanings_parts).split())
+                        self._meanings_parts = []
+                    self._finished.add(section)
+                break
+
+    def handle_data(self, data):
+        if self._anchor_parts is not None:
+            self._anchor_parts.append(data)
+        elif self._section == "meanings" and "meanings" not in self._finished:
+            self._meanings_parts.append(data)
+
+
+def parse_jisho_kanji_page(html):
+    """Return ``(meanings, kun_readings, on_readings)`` parsed from ``html``."""
+    parser = JishoKanjiParser()
+    parser.feed(html)
+    parser.close()
+    return parser.meanings, parser.kun_readings, parser.on_readings
+
+
+def format_kanji_line(kanji, meanings, kun_readings, on_readings):
+    """Build the single-line description written into the Notes field."""
+    parts = [kanji]
+    if meanings:
+        parts.append(meanings)
+    if kun_readings:
+        parts.append("Kun: " + READING_SEPARATOR.join(kun_readings))
+    if on_readings:
+        parts.append("On: " + READING_SEPARATOR.join(on_readings))
+    return " ".join(parts)
+
+
+def fetch_jisho_html(kanji, timeout=20):
+    """Download the Jisho kanji page for ``kanji``."""
+    query = urllib.parse.quote(kanji) + "%20%23kanji"
+    request = urllib.request.Request(
+        JISHO_SEARCH_URL.format(query=query), headers={"User-Agent": USER_AGENT}
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        charset = response.headers.get_content_charset() or "utf-8"
+        return response.read().decode(charset, "replace")
+
+
+class JishoClient:
+    """Fetches and caches Jisho kanji lookups for a single run."""
+
+    def __init__(self, delay=REQUEST_DELAY_SECONDS, fetcher=fetch_jisho_html):
+        self._cache = {}
+        self._delay = delay
+        self._fetch = fetcher
+
+    def lookup(self, kanji):
+        """Return the formatted line for ``kanji``, or ``None`` on failure."""
+        if kanji in self._cache:
+            return self._cache[kanji]
+        try:
+            html = self._fetch(kanji)
+        except (urllib.error.URLError, OSError) as exc:
+            print("  warning: could not fetch %s from Jisho (%s)" % (kanji, exc),
+                  file=sys.stderr)
+            self._cache[kanji] = None
+            return None
+        if self._delay:
+            time.sleep(self._delay)
+        meanings, kun, on = parse_jisho_kanji_page(html)
+        line = format_kanji_line(kanji, meanings, kun, on) if (meanings or kun or on) else None
+        if line is None:
+            print("  warning: no kanji entry found on Jisho for %s" % kanji, file=sys.stderr)
+        self._cache[kanji] = line
+        return line
+
+
+def anki_request(action, url=ANKI_CONNECT_URL, timeout=30, **params):
+    """Call an AnkiConnect action and return its result."""
+    payload = json.dumps(
+        {"action": action, "version": ANKI_CONNECT_VERSION, "params": params}
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        url, data=payload, headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        raise AnkiConnectError(
+            "Could not reach AnkiConnect at %s (%s).\n"
+            "Make sure Anki is running and the AnkiConnect add-on "
+            "(code 2055492159) is installed." % (url, exc)
+        )
+    except (OSError, ValueError) as exc:
+        raise AnkiConnectError("Invalid response from AnkiConnect: %s" % exc)
+    if isinstance(body, dict) and body.get("error"):
+        raise AnkiConnectError("AnkiConnect error for '%s': %s" % (action, body["error"]))
+    return body.get("result") if isinstance(body, dict) else None
+
+
+def build_notes_html(lines):
+    """Join kanji lines into the HTML stored in an Anki field."""
+    return "<br>".join(lines)
+
+
+def process(args):
+    url = args.url
+    query = "deck:%s" % args.deck
+    note_ids = anki_request("findNotes", url=url, query=query) or []
+    if not note_ids:
+        print("No notes found for query '%s'." % query)
+        return 0
+
+    notes = anki_request("notesInfo", url=url, notes=note_ids) or []
+    client = JishoClient()
+
+    updated = skipped = errors = 0
+    processed = 0
+    for note in notes:
+        fields = note.get("fields", {})
+        for field in (args.reading_field, args.notes_field):
+            if field not in fields:
+                raise AnkiConnectError(
+                    "Note %s has no field '%s'. Available fields: %s.\n"
+                    "Use --reading-field/--notes-field to match your note type."
+                    % (note.get("noteId"), field, ", ".join(sorted(fields)) or "(none)")
+                )
+
+        if not is_field_empty(fields[args.notes_field].get("value", "")):
+            continue
+
+        if args.limit and processed >= args.limit:
+            break
+        processed += 1
+
+        reading = fields[args.reading_field].get("value", "")
+        reading_text = strip_html(reading).strip()
+        kanji_list = extract_kanji(reading)
+        if not kanji_list:
+            print("Skipped %s (no kanji)" % (reading_text or note.get("noteId")))
+            skipped += 1
+            continue
+
+        lines = [line for line in (client.lookup(k) for k in kanji_list) if line]
+        if not lines:
+            print("Skipped %s (no Jisho results)" % reading_text)
+            errors += 1
+            continue
+
+        notes_html = build_notes_html(lines)
+        if args.dry_run:
+            print("Would update %s:" % reading_text)
+            for line in lines:
+                print("  %s" % line)
+            updated += 1
+            continue
+
+        try:
+            anki_request(
+                "updateNoteFields",
+                url=url,
+                note={"id": note["noteId"], "fields": {args.notes_field: notes_html}},
+            )
+        except AnkiConnectError as exc:
+            print("Error updating %s: %s" % (reading_text, exc), file=sys.stderr)
+            errors += 1
+            continue
+        print("Updated %s" % reading_text)
+        updated += 1
+
+    print(
+        "\nDone. %s: %d, skipped: %d, errors: %d"
+        % ("Would update" if args.dry_run else "Updated", updated, skipped, errors)
+    )
+    return 0 if errors == 0 else 1
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="updateKanji",
+        description="Fill empty Anki Notes fields with kanji meanings and "
+        "readings from Jisho.org.",
+    )
+    parser.add_argument("--deck", default="Immersion", help="Anki deck name (default: Immersion)")
+    parser.add_argument(
+        "--reading-field", default="Reading", help="Field holding the Japanese word (default: Reading)"
+    )
+    parser.add_argument(
+        "--notes-field", default="Notes", help="Field to fill in (default: Notes)"
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Show what would be written without changing Anki"
+    )
+    parser.add_argument(
+        "--limit", type=int, default=0, metavar="N", help="Only process the first N empty notes"
+    )
+    parser.add_argument(
+        "--url", default=ANKI_CONNECT_URL, help="AnkiConnect URL (default: %s)" % ANKI_CONNECT_URL
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    if args.limit < 0:
+        print("error: --limit must be zero or positive", file=sys.stderr)
+        return 2
+    try:
+        return process(args)
+    except AnkiConnectError as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
